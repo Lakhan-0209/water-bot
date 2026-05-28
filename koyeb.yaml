@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: water-bot
+name: water-bot
+services:
+  - name: water-bot
+    type: worker
+    git:
+      repository: github.com/Lakhan-0209/water-bot
+      branch: main
+    build:
+      buildpack: python
+    run:
+      command: python bot.py
+    env:
+      - key: 8608037770:AAFPO-adUUJjHiyipaKqEz-s36-HpNrUEZY
+        value: ""
