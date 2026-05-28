@@ -1,542 +1,382 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+"""
+bot.py – Water Reminder Telegram Bot
+Commands
+  /start          – register & welcome
+  /help           – show all commands
+  /log <ml>       – log water (e.g. /log 250)
+  /log_250        – quick-log shortcuts
+  /log_500
+  /log_750
+  /today          – today's summary
+  /stats          – weekly chart (text)
+  /month          – monthly summary
+  /streak         – current goal-met streak
+  /goal <ml>      – set daily goal
+  /interval <min> – set reminder interval (minutes)
+  /window <HH:MM> <HH:MM> – set reminder window
+  /timezone <tz>  – set timezone (e.g. Asia/Kolkata)
+  /pause          – pause reminders
+  /resume         – resume reminders
+"""
+
+import logging
+import os
+import re
+
+import pytz
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import sqlite3
-import datetime
-import os
 
-# ==========================================
-# BOT TOKEN (set via environment variable for Railway)
-# ==========================================
+import database as db
+import reminders
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# ==========================================
-# DATABASE SETUP
-# ==========================================
+TOKEN = os.environ["BOT_TOKEN"]
 
-conn = sqlite3.connect("users.db", check_same_thread=False)
-cursor = conn.cursor()
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-cursor.executescript("""
-CREATE TABLE IF NOT EXISTS users (
-    chat_id     INTEGER PRIMARY KEY,
-    reminder_interval INTEGER DEFAULT 60,
-    daily_goal  INTEGER DEFAULT 8,
-    active      INTEGER DEFAULT 1,
-    timezone    TEXT DEFAULT 'UTC'
-);
+def _register(update: Update):
+    u = update.effective_user
+    db.upsert_user(u.id, u.username or "", u.first_name or "friend")
+    return db.get_user(u.id)
 
-CREATE TABLE IF NOT EXISTS water_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id     INTEGER,
-    logged_at   TEXT,
-    glasses     INTEGER DEFAULT 1
-);
 
-CREATE TABLE IF NOT EXISTS streaks (
-    chat_id     INTEGER PRIMARY KEY,
-    current_streak  INTEGER DEFAULT 0,
-    longest_streak  INTEGER DEFAULT 0,
-    last_active_date TEXT
-);
-""")
-conn.commit()
+def _progress_bar(current, goal, width=10):
+    pct    = min(current / goal, 1.0)
+    filled = round(pct * width)
+    return "🟦" * filled + "⬜" * (width - filled), int(pct * 100)
 
-# ==========================================
-# SCHEDULER
-# ==========================================
 
-scheduler = AsyncIOScheduler()
+def _week_chart(stats, goal):
+    lines = []
+    for row in stats:
+        total = row["total"]
+        bar, pct = _progress_bar(total, goal, width=8)
+        tick = "✅" if total >= goal else "  "
+        lines.append(f"{row['day'][5:]}  {bar} {total:>5} ml {tick}")
+    return "\n".join(lines) if lines else "No data yet – start logging! /log 250"
 
-# ==========================================
-# HELPERS
-# ==========================================
 
-def get_user(chat_id):
-    cursor.execute("SELECT * FROM users WHERE chat_id=?", (chat_id,))
-    return cursor.fetchone()
+# ── Command handlers ───────────────────────────────────────────────────────────
 
-def today_str():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = _register(update)
+    name = user["first_name"]
 
-def glasses_today(chat_id):
-    cursor.execute(
-        "SELECT COALESCE(SUM(glasses),0) FROM water_log WHERE chat_id=? AND date(logged_at)=date('now')",
-        (chat_id,)
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("💧 Log 250 ml"), KeyboardButton("💧 Log 500 ml")],
+         [KeyboardButton("📊 Today"),      KeyboardButton("📈 Stats")]],
+        resize_keyboard=True,
     )
-    return cursor.fetchone()[0]
-
-def update_streak(chat_id):
-    today = today_str()
-    cursor.execute("SELECT * FROM streaks WHERE chat_id=?", (chat_id,))
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute(
-            "INSERT INTO streaks VALUES (?,1,1,?)", (chat_id, today)
-        )
-    else:
-        _, current, longest, last_date = row
-        if last_date == today:
-            return  # already updated today
-        yesterday = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        if last_date == yesterday:
-            current += 1
-        else:
-            current = 1
-        longest = max(longest, current)
-        cursor.execute(
-            "UPDATE streaks SET current_streak=?, longest_streak=?, last_active_date=? WHERE chat_id=?",
-            (current, longest, today, chat_id)
-        )
-    conn.commit()
-
-def get_streak(chat_id):
-    cursor.execute("SELECT current_streak, longest_streak FROM streaks WHERE chat_id=?", (chat_id,))
-    row = cursor.fetchone()
-    return row if row else (0, 0)
-
-def progress_bar(current, goal, length=10):
-    filled = int((current / goal) * length) if goal > 0 else 0
-    filled = min(filled, length)
-    return "🟦" * filled + "⬜" * (length - filled)
-
-def log_water_glass(chat_id, glasses=1):
-    cursor.execute(
-        "INSERT INTO water_log (chat_id, logged_at, glasses) VALUES (?, datetime('now'), ?)",
-        (chat_id, glasses)
-    )
-    conn.commit()
-
-    # Check if goal met today → update streak
-    user = get_user(chat_id)
-    if user:
-        goal = user[2]
-        if glasses_today(chat_id) >= goal:
-            update_streak(chat_id)
-
-# ==========================================
-# SEND REMINDER
-# ==========================================
-
-async def send_reminder(bot, chat_id):
-    try:
-        user = get_user(chat_id)
-        if not user or not user[3]:  # inactive
-            return
-
-        goal = user[2]
-        drunk = glasses_today(chat_id)
-        remaining = max(0, goal - drunk)
-        bar = progress_bar(drunk, goal)
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("💧 Log 1 glass", callback_data="log_1"),
-                InlineKeyboardButton("💧💧 Log 2 glasses", callback_data="log_2"),
-            ],
-            [InlineKeyboardButton("📊 Today's Stats", callback_data="stats_today")]
-        ])
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⏰ *Time to drink water!*\n\n"
-                f"{bar}\n"
-                f"✅ Drank: *{drunk}/{goal}* glasses today\n"
-                f"🎯 Remaining: *{remaining}* glasses\n\n"
-                f"Tap below to log your glass!"
-            ),
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        print(f"Reminder error for {chat_id}:", e)
-
-# ==========================================
-# /start COMMAND
-# ==========================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    name = update.effective_chat.first_name or "there"
-
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,)
-    )
-    cursor.execute(
-        "UPDATE users SET active=1 WHERE chat_id=?", (chat_id,)
-    )
-    conn.commit()
-
-    user = get_user(chat_id)
-    interval = user[1]
-
-    # Reschedule
-    try:
-        scheduler.remove_job(str(chat_id))
-    except:
-        pass
-
-    scheduler.add_job(
-        send_reminder,
-        "interval",
-        minutes=interval,
-        args=[context.bot, chat_id],
-        id=str(chat_id)
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💧 Log Water", callback_data="log_1"),
-            InlineKeyboardButton("📊 My Stats", callback_data="stats_today"),
-        ],
-        [
-            InlineKeyboardButton("🏆 Streaks", callback_data="streaks"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-        ]
-    ])
 
     await update.message.reply_text(
-        f"👋 Hey *{name}*! Welcome to your personal Water Reminder Bot! 💧\n\n"
-        f"I'll remind you every *{interval} minutes* to drink water.\n"
-        f"Your daily goal: *8 glasses* 🎯\n\n"
-        f"*Commands:*\n"
-        f"/set `<mins>` — Change reminder interval\n"
-        f"/goal `<glasses>` — Set daily goal\n"
-        f"/log — Log a glass of water\n"
-        f"/stats — Today's stats\n"
-        f"/weekly — Weekly report\n"
-        f"/streak — Your streak\n"
-        f"/stop — Pause reminders\n"
-        f"/help — Show all commands",
+        f"👋 Hi *{name}*! I'm your personal Water Reminder bot.\n\n"
+        f"🥅 Daily goal: *{user['daily_goal']} ml*\n"
+        f"⏰ Reminders: every *{user['reminder_interval']} min* "
+        f"({user['reminder_start']} – {user['reminder_end']})\n"
+        f"🌍 Timezone: *{user['timezone']}*\n\n"
+        f"Start logging with /log 250 or tap the buttons below!\n"
+        f"See all commands with /help",
         parse_mode="Markdown",
-        reply_markup=keyboard
+        reply_markup=keyboard,
     )
 
-# ==========================================
-# /set COMMAND
-# ==========================================
+    reminders.reschedule_user(ctx.application, update.effective_user.id)
 
-async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
 
-    if not context.args:
-        await update.message.reply_text("Usage: /set `30` (minutes)", parse_mode="Markdown")
-        return
-
-    try:
-        minutes = int(context.args[0])
-        if minutes <= 0:
-            raise ValueError
-
-        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-        cursor.execute("UPDATE users SET reminder_interval=? WHERE chat_id=?", (minutes, chat_id))
-        conn.commit()
-
-        try:
-            scheduler.remove_job(str(chat_id))
-        except:
-            pass
-
-        scheduler.add_job(
-            send_reminder, "interval", minutes=minutes,
-            args=[context.bot, chat_id], id=str(chat_id)
-        )
-
-        await update.message.reply_text(
-            f"✅ Reminder set to every *{minutes} minutes*!", parse_mode="Markdown"
-        )
-
-    except:
-        await update.message.reply_text("❌ Please provide a valid number. Example: /set 30")
-
-# ==========================================
-# /goal COMMAND
-# ==========================================
-
-async def set_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if not context.args:
-        await update.message.reply_text("Usage: /goal `8` (glasses per day)", parse_mode="Markdown")
-        return
-
-    try:
-        goal = int(context.args[0])
-        if goal <= 0:
-            raise ValueError
-
-        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-        cursor.execute("UPDATE users SET daily_goal=? WHERE chat_id=?", (goal, chat_id))
-        conn.commit()
-
-        await update.message.reply_text(
-            f"🎯 Daily goal updated to *{goal} glasses*!", parse_mode="Markdown"
-        )
-    except:
-        await update.message.reply_text("❌ Please provide a valid number. Example: /goal 10")
-
-# ==========================================
-# /log COMMAND
-# ==========================================
-
-async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    glasses = 1
-    if context.args:
-        try:
-            glasses = max(1, int(context.args[0]))
-        except:
-            pass
-
-    cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-    log_water_glass(chat_id, glasses)
-
-    user = get_user(chat_id)
-    goal = user[2]
-    drunk = glasses_today(chat_id)
-    bar = progress_bar(drunk, goal)
-
-    msg = (
-        f"💧 Logged *{glasses}* glass{'es' if glasses > 1 else ''}!\n\n"
-        f"{bar}\n"
-        f"*{drunk}/{goal}* glasses today"
+async def cmd_help(update: Update, _):
+    await update.message.reply_text(
+        "*All Commands*\n\n"
+        "💧 *Logging*\n"
+        "/log `<ml>` – log any amount (e.g. /log 350)\n"
+        "/log\\_250 · /log\\_500 · /log\\_750 – quick shortcuts\n\n"
+        "📊 *Stats*\n"
+        "/today – today's progress\n"
+        "/stats – past 7 days\n"
+        "/month – this month\n"
+        "/streak – goal streak\n\n"
+        "⚙️ *Settings*\n"
+        "/goal `<ml>` – daily goal (default 2500)\n"
+        "/interval `<min>` – reminder every N minutes (min 15)\n"
+        "/window `HH:MM` `HH:MM` – active hours\n"
+        "/timezone `<tz>` – e.g. Asia/Kolkata, UTC, US/Eastern\n\n"
+        "🔔 *Reminders*\n"
+        "/pause – stop reminders\n"
+        "/resume – restart reminders",
+        parse_mode="Markdown",
     )
-    if drunk >= goal:
-        msg += "\n\n🎉 *Goal reached! Amazing work!*"
 
+
+async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = _register(update)
+    uid  = update.effective_user.id
+
+    # Extract amount from command text or args
+    text = update.message.text or ""
+    match = re.search(r"\d+", text)
+    if not match:
+        await update.message.reply_text("Usage: /log 250  (amount in ml)")
+        return
+
+    amount = int(match.group())
+    if not (10 <= amount <= 5000):
+        await update.message.reply_text("Please log between 10 and 5000 ml.")
+        return
+
+    db.log_water(uid, amount)
+    today = db.get_today_total(uid)
+    goal  = user["daily_goal"]
+    bar, pct = _progress_bar(today, goal)
+
+    extra = ""
+    if today >= goal:
+        extra = "\n\n🎉 *Goal reached!* Amazing work today."
+
+    await update.message.reply_text(
+        f"✅ Logged *{amount} ml*\n\n"
+        f"{bar} {pct}%\n"
+        f"Today: *{today} ml* / {goal} ml{extra}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_today(update: Update, _):
+    user  = _register(update)
+    uid   = update.effective_user.id
+    today = db.get_today_total(uid)
+    goal  = user["daily_goal"]
+    bar, pct = _progress_bar(today, goal)
+    remain = max(goal - today, 0)
+
+    status = "🎉 Goal reached!" if today >= goal else f"Need *{remain} ml* more"
+
+    await update.message.reply_text(
+        f"📊 *Today's Progress*\n\n"
+        f"{bar} {pct}%\n"
+        f"Drank: *{today} ml* / {goal} ml\n"
+        f"{status}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_stats(update: Update, _):
+    user  = _register(update)
+    uid   = update.effective_user.id
+    stats = db.get_week_stats(uid)
+    chart = _week_chart(stats, user["daily_goal"])
+
+    await update.message.reply_text(
+        f"📈 *Last 7 Days*\n\n`{chart}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_month(update: Update, _):
+    user  = _register(update)
+    uid   = update.effective_user.id
+    stats = db.get_month_stats(uid)
+    goal  = user["daily_goal"]
+
+    if not stats:
+        await update.message.reply_text("No data this month yet!")
+        return
+
+    days_met  = sum(1 for r in stats if r["total"] >= goal)
+    total_ml  = sum(r["total"] for r in stats)
+    days_logged = len(stats)
+    avg       = total_ml // days_logged if days_logged else 0
+
+    chart = _week_chart(stats[-7:], goal)   # last 7 days of month
+
+    await update.message.reply_text(
+        f"📅 *This Month*\n\n"
+        f"Days logged: *{days_logged}*\n"
+        f"Days goal met: *{days_met}*\n"
+        f"Total: *{total_ml} ml*\n"
+        f"Daily average: *{avg} ml*\n\n"
+        f"*Recent 7 days:*\n`{chart}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_streak(update: Update, _):
+    user   = _register(update)
+    uid    = update.effective_user.id
+    streak = db.get_streak(uid, user["daily_goal"])
+
+    emoji = "🔥" if streak >= 3 else "💧"
+    msg   = (
+        f"{emoji} *{streak}-day streak!* Keep it up!"
+        if streak > 0
+        else "No streak yet — log today to start one! /log 250"
+    )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ==========================================
-# /stats COMMAND
-# ==========================================
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-    user = get_user(chat_id)
-    goal = user[2]
-    interval = user[1]
+async def cmd_goal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
 
-    drunk = glasses_today(chat_id)
-    remaining = max(0, goal - drunk)
-    bar = progress_bar(drunk, goal)
-    current_streak, longest_streak = get_streak(chat_id)
-
-    status = "🎉 Goal reached!" if drunk >= goal else f"💪 Keep going! {remaining} more to go"
-
-    await update.message.reply_text(
-        f"📊 *Today's Stats*\n\n"
-        f"{bar}\n"
-        f"💧 Drank: *{drunk}* glasses\n"
-        f"🎯 Goal: *{goal}* glasses\n"
-        f"⏰ Reminder: every *{interval}* mins\n\n"
-        f"{status}\n\n"
-        f"🔥 Current streak: *{current_streak}* day{'s' if current_streak != 1 else ''}\n"
-        f"🏆 Best streak: *{longest_streak}* day{'s' if longest_streak != 1 else ''}",
-        parse_mode="Markdown"
-    )
-
-# ==========================================
-# /weekly COMMAND
-# ==========================================
-
-async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-    user = get_user(chat_id)
-    goal = user[2]
-
-    cursor.execute("""
-        SELECT date(logged_at), SUM(glasses)
-        FROM water_log
-        WHERE chat_id=? AND logged_at >= datetime('now', '-6 days')
-        GROUP BY date(logged_at)
-        ORDER BY date(logged_at) ASC
-    """, (chat_id,))
-    rows = cursor.fetchall()
-
-    day_map = {r[0]: r[1] for r in rows}
-    total = sum(day_map.values())
-    days_goal_met = sum(1 for v in day_map.values() if v >= goal)
-
-    lines = ["📅 *Weekly Report (Last 7 Days)*\n"]
-    for i in range(6, -1, -1):
-        day = (datetime.datetime.utcnow() - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-        label = (datetime.datetime.utcnow() - datetime.timedelta(days=i)).strftime("%a %d %b")
-        drunk = day_map.get(day, 0)
-        bar = progress_bar(drunk, goal, length=6)
-        tick = "✅" if drunk >= goal else ("🔵" if drunk > 0 else "⬜")
-        lines.append(f"{tick} {label}: {bar} *{drunk}*💧")
-
-    lines.append(f"\n📊 Total this week: *{total}* glasses")
-    lines.append(f"🏅 Goals met: *{days_goal_met}/7* days")
-    avg = round(total / 7, 1)
-    lines.append(f"📈 Daily average: *{avg}* glasses")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-# ==========================================
-# /streak COMMAND
-# ==========================================
-
-async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    current, longest = get_streak(chat_id)
-
-    emoji = "🔥" if current >= 3 else "💧"
-    await update.message.reply_text(
-        f"{emoji} *Your Streaks*\n\n"
-        f"🔥 Current streak: *{current}* day{'s' if current != 1 else ''}\n"
-        f"🏆 Longest streak: *{longest}* day{'s' if longest != 1 else ''}\n\n"
-        f"{'Keep it up! You are on fire!' if current >= 3 else 'Hit your daily goal to build your streak! 💪'}",
-        parse_mode="Markdown"
-    )
-
-# ==========================================
-# /stop COMMAND
-# ==========================================
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    cursor.execute("UPDATE users SET active=0 WHERE chat_id=?", (chat_id,))
-    conn.commit()
-
+    if not ctx.args:
+        await update.message.reply_text("Usage: /goal 2500  (ml per day)")
+        return
     try:
-        scheduler.remove_job(str(chat_id))
-    except:
-        pass
+        goal = int(ctx.args[0])
+        assert 500 <= goal <= 10000
+    except (ValueError, AssertionError):
+        await update.message.reply_text("Goal must be between 500 and 10000 ml.")
+        return
 
+    db.set_user_field(uid, "daily_goal", goal)
+    await update.message.reply_text(f"✅ Daily goal set to *{goal} ml*.", parse_mode="Markdown")
+
+
+async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
+
+    if not ctx.args:
+        await update.message.reply_text("Usage: /interval 60  (minutes between reminders, min 15)")
+        return
+    try:
+        mins = int(ctx.args[0])
+        assert 15 <= mins <= 480
+    except (ValueError, AssertionError):
+        await update.message.reply_text("Interval must be between 15 and 480 minutes.")
+        return
+
+    db.set_user_field(uid, "reminder_interval", mins)
+    reminders.reschedule_user(ctx.application, uid)
     await update.message.reply_text(
-        "⏸ Reminders paused. Use /start to resume anytime! 💧"
+        f"✅ Reminders set to every *{mins} minutes*.", parse_mode="Markdown"
     )
 
-# ==========================================
-# /help COMMAND
-# ==========================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_window(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
+
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /window 08:00 22:00")
+        return
+
+    def valid_time(s):
+        return re.fullmatch(r"\d{2}:\d{2}", s)
+
+    if not valid_time(ctx.args[0]) or not valid_time(ctx.args[1]):
+        await update.message.reply_text("Format: HH:MM  e.g. /window 07:00 23:00")
+        return
+
+    db.set_user_field(uid, "reminder_start", ctx.args[0])
+    db.set_user_field(uid, "reminder_end",   ctx.args[1])
+    reminders.reschedule_user(ctx.application, uid)
     await update.message.reply_text(
-        "💧 *Water Reminder Bot — Commands*\n\n"
-        "*/start* — Start / resume reminders\n"
-        "*/stop* — Pause reminders\n"
-        "*/set `<mins>`* — Set reminder interval (e.g. /set 45)\n"
-        "*/goal `<n>`* — Set daily glass goal (e.g. /goal 10)\n"
-        "*/log `[n]`* — Log water (e.g. /log 2 for 2 glasses)\n"
-        "*/stats* — Today's progress\n"
-        "*/weekly* — Last 7 days report\n"
-        "*/streak* — View your streaks\n"
-        "*/help* — Show this menu",
-        parse_mode="Markdown"
+        f"✅ Reminder window: *{ctx.args[0]} – {ctx.args[1]}*.", parse_mode="Markdown"
     )
 
-# ==========================================
-# CALLBACK QUERY HANDLER (inline buttons)
-# ==========================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    data = query.data
+async def cmd_timezone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
 
-    cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-    user = get_user(chat_id)
-    goal = user[2]
-
-    if data.startswith("log_"):
-        glasses = int(data.split("_")[1])
-        log_water_glass(chat_id, glasses)
-        drunk = glasses_today(chat_id)
-        bar = progress_bar(drunk, goal)
-        msg = (
-            f"💧 Logged *{glasses}* glass{'es' if glasses > 1 else ''}!\n\n"
-            f"{bar}\n*{drunk}/{goal}* glasses today"
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: /timezone Asia/Kolkata\n"
+            "Common: UTC, US/Eastern, US/Pacific, Europe/London, Asia/Kolkata"
         )
-        if drunk >= goal:
-            msg += "\n\n🎉 *Goal reached! Amazing!*"
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        return
 
-    elif data == "stats_today":
-        drunk = glasses_today(chat_id)
-        remaining = max(0, goal - drunk)
-        bar = progress_bar(drunk, goal)
-        current_streak, longest_streak = get_streak(chat_id)
-        status = "🎉 Goal reached!" if drunk >= goal else f"💪 {remaining} more to go"
-        await query.edit_message_text(
-            f"📊 *Today's Stats*\n\n"
-            f"{bar}\n"
-            f"💧 Drank: *{drunk}/{goal}* glasses\n"
-            f"{status}\n\n"
-            f"🔥 Streak: *{current_streak}* days | 🏆 Best: *{longest_streak}*",
-            parse_mode="Markdown"
+    tz_str = ctx.args[0]
+    try:
+        pytz.timezone(tz_str)
+    except pytz.UnknownTimeZoneError:
+        await update.message.reply_text(
+            f"Unknown timezone: {tz_str}\n"
+            "Find yours at https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
         )
+        return
 
-    elif data == "streaks":
-        current, longest = get_streak(chat_id)
-        emoji = "🔥" if current >= 3 else "💧"
-        await query.edit_message_text(
-            f"{emoji} *Your Streaks*\n\n"
-            f"🔥 Current: *{current}* days\n"
-            f"🏆 Best: *{longest}* days",
-            parse_mode="Markdown"
-        )
+    db.set_user_field(uid, "timezone", tz_str)
+    await update.message.reply_text(f"✅ Timezone set to *{tz_str}*.", parse_mode="Markdown")
 
-    elif data == "settings":
-        interval = user[1]
-        await query.edit_message_text(
-            f"⚙️ *Your Settings*\n\n"
-            f"⏰ Reminder every: *{interval} mins*\n"
-            f"🎯 Daily goal: *{goal} glasses*\n\n"
-            f"Change with:\n/set `<mins>` — e.g. /set 45\n/goal `<n>` — e.g. /goal 10",
-            parse_mode="Markdown"
-        )
 
-# ==========================================
-# LOAD ACTIVE USERS ON RESTART
-# ==========================================
+async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
+    db.set_user_field(uid, "active", 0)
+    reminders.reschedule_user(ctx.application, uid)
+    await update.message.reply_text("⏸ Reminders paused. Use /resume to restart.")
 
-def load_users(bot):
-    cursor.execute("SELECT chat_id, reminder_interval FROM users WHERE active=1")
-    users = cursor.fetchall()
-    for chat_id, interval in users:
-        try:
-            scheduler.add_job(
-                send_reminder, "interval", minutes=interval,
-                args=[bot, chat_id], id=str(chat_id)
-            )
-        except:
-            pass
 
-# ==========================================
-# MAIN
-# ==========================================
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register(update)
+    uid = update.effective_user.id
+    db.set_user_field(uid, "active", 1)
+    reminders.reschedule_user(ctx.application, uid)
+    await update.message.reply_text("▶️ Reminders resumed! Stay hydrated 💧")
+
+
+# ── Keyboard button handler ────────────────────────────────────────────────────
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text == "💧 Log 250 ml":
+        ctx.args = ["250"]
+        await cmd_log(update, ctx)
+    elif text == "💧 Log 500 ml":
+        ctx.args = ["500"]
+        await cmd_log(update, ctx)
+    elif text == "📊 Today":
+        await cmd_today(update, ctx)
+    elif text == "📈 Stats":
+        await cmd_stats(update, ctx)
+
+
+# ── App bootstrap ──────────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    db.init_db()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("set", set_timer))
-    app.add_handler(CommandHandler("goal", set_goal))
-    app.add_handler(CommandHandler("log", log_command))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("weekly", weekly))
-    app.add_handler(CommandHandler("streak", streak_command))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app = Application.builder().token(TOKEN).build()
 
-    scheduler.start()
-    load_users(app.bot)
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("log",      cmd_log))
+    app.add_handler(CommandHandler("log_250",  cmd_log))
+    app.add_handler(CommandHandler("log_500",  cmd_log))
+    app.add_handler(CommandHandler("log_750",  cmd_log))
+    app.add_handler(CommandHandler("today",    cmd_today))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("month",    cmd_month))
+    app.add_handler(CommandHandler("streak",   cmd_streak))
+    app.add_handler(CommandHandler("goal",     cmd_goal))
+    app.add_handler(CommandHandler("interval", cmd_interval))
+    app.add_handler(CommandHandler("window",   cmd_window))
+    app.add_handler(CommandHandler("timezone", cmd_timezone))
+    app.add_handler(CommandHandler("pause",    cmd_pause))
+    app.add_handler(CommandHandler("resume",   cmd_resume))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🤖 Water Bot Running...")
-    app.run_polling()
+    # Start reminders after app is ready
+    async def post_init(application):
+        reminders.start_scheduler(application)
+
+    app.post_init = post_init
+
+    logger.info("Bot starting…")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
