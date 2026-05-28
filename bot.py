@@ -1,22 +1,5 @@
 """
-bot.py – Water Reminder Telegram Bot
-Commands
-  /start          – register & welcome
-  /help           – show all commands
-  /log <ml>       – log water (e.g. /log 250)
-  /log_250        – quick-log shortcuts
-  /log_500
-  /log_750
-  /today          – today's summary
-  /stats          – weekly chart (text)
-  /month          – monthly summary
-  /streak         – current goal-met streak
-  /goal <ml>      – set daily goal
-  /interval <min> – set reminder interval (minutes)
-  /window <HH:MM> <HH:MM> – set reminder window
-  /timezone <tz>  – set timezone (e.g. Asia/Kolkata)
-  /pause          – pause reminders
-  /resume         – resume reminders
+bot.py – Water Reminder Telegram Bot (compatible with python-telegram-bot v21+)
 """
 
 import logging
@@ -42,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN = "8608037770:AAFPO-adUUJjHiyipaKqEz-s36-HpNrUEZY"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -122,7 +105,6 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = _register(update)
     uid  = update.effective_user.id
 
-    # Extract amount from command text or args
     text = update.message.text or ""
     match = re.search(r"\d+", text)
     if not match:
@@ -192,12 +174,11 @@ async def cmd_month(update: Update, _):
         await update.message.reply_text("No data this month yet!")
         return
 
-    days_met  = sum(1 for r in stats if r["total"] >= goal)
-    total_ml  = sum(r["total"] for r in stats)
+    days_met    = sum(1 for r in stats if r["total"] >= goal)
+    total_ml    = sum(r["total"] for r in stats)
     days_logged = len(stats)
-    avg       = total_ml // days_logged if days_logged else 0
-
-    chart = _week_chart(stats[-7:], goal)   # last 7 days of month
+    avg         = total_ml // days_logged if days_logged else 0
+    chart       = _week_chart(stats[-7:], goal)
 
     await update.message.reply_text(
         f"📅 *This Month*\n\n"
@@ -247,7 +228,7 @@ async def cmd_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if not ctx.args:
-        await update.message.reply_text("Usage: /interval 60  (minutes between reminders, min 15)")
+        await update.message.reply_text("Usage: /interval 60  (minutes, min 15)")
         return
     try:
         mins = int(ctx.args[0])
@@ -332,10 +313,10 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "💧 Log 250 ml":
-        ctx.args = ["250"]
+        update.message.text = "/log 250"
         await cmd_log(update, ctx)
     elif text == "💧 Log 500 ml":
-        ctx.args = ["500"]
+        update.message.text = "/log 500"
         await cmd_log(update, ctx)
     elif text == "📊 Today":
         await cmd_today(update, ctx)
@@ -348,7 +329,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     db.init_db()
 
-    app = Application.builder().token(TOKEN).build()
+    async def post_init(application):
+        reminders.start_scheduler(application)
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
@@ -367,12 +356,6 @@ def main():
     app.add_handler(CommandHandler("pause",    cmd_pause))
     app.add_handler(CommandHandler("resume",   cmd_resume))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Start reminders after app is ready
-    async def post_init(application):
-        reminders.start_scheduler(application)
-
-    app.post_init = post_init
 
     logger.info("Bot starting…")
     app.run_polling(drop_pending_updates=True)
